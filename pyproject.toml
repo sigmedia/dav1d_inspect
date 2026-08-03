@@ -1,0 +1,87 @@
+[build-system]
+# meson + ninja are pulled into the isolated build env so the native build works
+# even when they are not installed system-wide. (A C compiler — and nasm, for the
+# hand-written asm — must still be present on the machine doing the install.)
+requires = ["hatchling", "meson>=1.1", "ninja"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dav1d-inspect"
+dynamic = ["version"]
+description = "In-memory AV1 block-metadata extraction from motion-vector inspection"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+authors = [
+    {name = "Julien Zouein", email = "zoueinj@tcd.ie"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Repository = "https://github.com/joueinj/dav1d-inspect"
+Issues = "https://github.com/joueinj/dav1d-inspect/issues"
+
+[project.optional-dependencies]
+dev = [
+    "av>=12.0",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+dav1d-inspect = "dav1d_inspect.cli:main"
+
+[tool.hatch.version]
+path = "dav1d_inspect/__init__.py"
+
+# The native libraries are compiled at build time by this hook and bundled into
+# the wheel (see hatch_build.py + dav1d_inspect/_build.py).
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dav1d_inspect"]
+# _libs/ is populated and force-included by the build hook, not the package glob.
+exclude = [
+    "dav1d_inspect/_libs/**",
+    "**/__pycache__/**",
+]
+
+# The sdist carries the vendored, patched dav1d source + shim so the wheel can be
+# built offline on the target. It must NOT carry the build tree or prebuilt libs.
+[tool.hatch.build.targets.sdist]
+include = [
+    "dav1d_inspect/**",
+    "native/**",
+    "hatch_build.py",
+    "patches/**",
+    "README.md",
+    "pyproject.toml",
+]
+exclude = [
+    "native/dav1d/build/**",
+    "native/dav1d/.git/**",
+    "dav1d_inspect/_libs/**",
+    "**/__pycache__/**",
+    "**/*.so",
+    "**/*.so.*",
+    "**/*.dylib",
+    "**/*.dll",
+    "**/*.pyc",
+    "dist",
+    ".venv",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]

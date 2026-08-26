@@ -365,6 +365,37 @@ class _Av1ofFrame(C.Structure):
     ]
 
 
+class _Av1ofRgbFrame(C.Structure):
+    _fields_ = [
+        ("decode_seq", C.c_uint),
+        ("frame_offset", C.c_uint),
+        ("frame_type", C.c_int),
+        ("source_width", C.c_int),
+        ("source_height", C.c_int),
+        ("width", C.c_int),
+        ("height", C.c_int),
+        ("blk_w", C.c_int),
+        ("blk_h", C.c_int),
+        ("refidx", C.c_int8 * 7),
+        ("refpoc", C.c_uint * 7),
+        ("bpc", C.c_int),
+        ("matrix", C.c_int),
+        ("full_range", C.c_int),
+        ("ref_distance", C.c_int * 8),
+        ("motion_vectors", C.POINTER(C.c_int16)),
+        ("reference_map", C.POINTER(C.c_int16)),
+        ("block_map", C.POINTER(C.c_uint8)),
+        ("rgb", C.POINTER(C.c_uint8)),
+        ("motion_field", C.POINTER(C.c_float)),
+    ]
+
+
+_RGB_PROCESS_MOTION = 1
+_RGB_LINEAR = 2
+_RGB_NORMALIZE = 4
+_RGB_NAN_TO_NUM = 8
+
+
 # ---------------------------------------------------------------------------
 # Library location helpers
 # ---------------------------------------------------------------------------
@@ -463,6 +494,29 @@ def _load_shim_for_path(shim_path: Path) -> C.CDLL | None:
     lib.av1of_get_frame.argtypes = [C.c_void_p, C.c_int]
     lib.av1of_get_frame.restype = C.POINTER(_Av1ofFrame)
     lib.av1of_free.argtypes = [C.c_void_p]
+    # RGB symbols are additive.  A stale/older shim remains usable for the
+    # motion-only API and is treated like a missing RGB shim by iter_rgb_frames.
+    try:
+        decode_rgb = lib.av1of_decode_rgb
+    except AttributeError:
+        return lib
+    decode_rgb.argtypes = [
+        C.c_char_p,
+        C.c_int,
+        C.c_int,
+        C.c_int,
+        C.c_uint,
+        C.c_uint,
+        C.c_uint,
+        C.POINTER(C.c_void_p),
+    ]
+    decode_rgb.restype = C.c_int
+    lib.av1of_rgb_num_frames.argtypes = [C.c_void_p]
+    lib.av1of_rgb_num_frames.restype = C.c_int
+    lib.av1of_rgb_get_frame.argtypes = [C.c_void_p, C.c_int]
+    lib.av1of_rgb_get_frame.restype = C.POINTER(_Av1ofRgbFrame)
+    lib.av1of_rgb_release_frame.argtypes = [C.c_void_p, C.c_int]
+    lib.av1of_rgb_free.argtypes = [C.c_void_p]
     return lib
 
 
@@ -574,6 +628,289 @@ def iter_frames(
             px = frame.get("pixels")
             frame["rgb"] = yuv_to_rgb(px) if px is not None else None
         yield frame
+
+
+def iter_rgb_frames(
+    ivf_path: str | Path,
+    n_threads: int = 0,
+    *,
+    step: int = 1,
+    max_frames: int = 0,
+    target_size: tuple[int, int] | None = None,
+    process_motion: bool = False,
+    linear_interpolation: bool = False,
+    normalize_flow: bool = False,
+    nan_to_num: bool = False,
+) -> Generator[dict, None, None]:
+    """Decode RGB and block metadata together through the native C shim.
+
+    ``target_size`` is ``(width, height)``.  Every input frame up to the last
+    requested sample is decoded (so dav1d's reference state stays valid), while
+    only decode sequences ``0, step, 2*step, ...`` are materialized.  A zero
+    ``max_frames`` keeps all matching samples.
+
+    With ``process_motion=True``, ``motion_field`` is a nearest-neighbour lift
+    of the primary/backward 4x4-grid MV, in pixels (dav1d's 1/8-pel units are
+    divided by eight).  ``linear_interpolation`` additionally divides each MV
+    by its unwrapped temporal reference distance, ``normalize_flow`` divides
+    x/y by the coded frame width/height and clips to [-1, 1], and ``nan_to_num``
+    changes zero-distance samples from NaN to zero.
+
+    The C call performs the whole decode with the GIL released.  Returned NumPy
+    arrays own their data; each native frame payload is released immediately
+    after it has been copied.  If the RGB ABI is unavailable, this function
+    falls back to the existing ctypes callback decoder.
+    """
+    try:
+        step = int(step)
+        max_frames = int(max_frames)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("step and max_frames must be integers") from exc
+    if step < 1:
+        raise ValueError("step must be >= 1")
+    if max_frames < 0:
+        raise ValueError("max_frames must be >= 0")
+    if step > 0xFFFFFFFF or max_frames > 0xFFFFFFFF:
+        raise ValueError("step and max_frames must fit in an unsigned 32-bit integer")
+    if target_size is None:
+        target_width = target_height = 0
+    else:
+        try:
+            size_items = tuple(target_size)
+        except TypeError as exc:
+            raise ValueError("target_size must be a (width, height) pair") from exc
+        if len(size_items) != 2:
+            raise ValueError("target_size must be a (width, height) pair")
+        target_width, target_height = map(int, size_items)
+        if target_width <= 0 or target_height <= 0:
+            raise ValueError("target_size dimensions must be > 0")
+        if target_width > 0x7FFFFFFF or target_height > 0x7FFFFFFF:
+            raise ValueError("target_size dimensions must fit in a signed 32-bit integer")
+
+    libdav1d, shim_path = _locate_libs()
+    if shim_path is not None:
+        shim = _load_shim_for_path(shim_path)
+        if shim is not None and hasattr(shim, "av1of_decode_rgb"):
+            yield from _iter_rgb_frames_via_shim(
+                shim,
+                ivf_path,
+                n_threads,
+                step,
+                max_frames,
+                target_width,
+                target_height,
+                process_motion,
+                linear_interpolation,
+                normalize_flow,
+                nan_to_num,
+            )
+            return
+
+    lib = _load_lib(libdav1d)
+    yield from _iter_rgb_frames_via_callback(
+        ivf_path,
+        n_threads,
+        lib,
+        step,
+        max_frames,
+        target_width,
+        target_height,
+        process_motion,
+        linear_interpolation,
+        normalize_flow,
+        nan_to_num,
+    )
+
+
+def _iter_rgb_frames_via_shim(
+    shim: C.CDLL,
+    ivf_path: str | Path,
+    n_threads: int,
+    step: int,
+    max_frames: int,
+    target_width: int,
+    target_height: int,
+    process_motion: bool,
+    linear_interpolation: bool,
+    normalize_flow: bool,
+    nan_to_num: bool,
+):
+    flags = 0
+    if process_motion:
+        flags |= _RGB_PROCESS_MOTION
+    if linear_interpolation:
+        flags |= _RGB_LINEAR
+    if normalize_flow:
+        flags |= _RGB_NORMALIZE
+    if nan_to_num:
+        flags |= _RGB_NAN_TO_NUM
+    handle = C.c_void_p()
+    rc = shim.av1of_decode_rgb(
+        str(ivf_path).encode(),
+        int(n_threads),
+        target_width,
+        target_height,
+        step,
+        max_frames,
+        flags,
+        C.byref(handle),
+    )
+    if rc != 0:
+        raise RuntimeError(f"av1of_decode_rgb failed ({rc}) for {ivf_path}")
+    try:
+        n = shim.av1of_rgb_num_frames(handle)
+        for i in range(n):
+            frame_ptr = shim.av1of_rgb_get_frame(handle, i)
+            if not frame_ptr:
+                raise RuntimeError(f"av1of_rgb_get_frame failed for frame {i}")
+            f = frame_ptr.contents
+            try:
+                mv = np.ctypeslib.as_array(
+                    f.motion_vectors, shape=(f.blk_h, f.blk_w, 4)
+                ).copy()
+                ref = np.ctypeslib.as_array(
+                    f.reference_map, shape=(f.blk_h, f.blk_w, 2)
+                ).copy()
+                bs = np.ctypeslib.as_array(
+                    f.block_map, shape=(f.blk_h, f.blk_w)
+                ).copy()
+                rgb = None
+                if f.rgb and f.width > 0 and f.height > 0:
+                    rgb = np.ctypeslib.as_array(
+                        f.rgb, shape=(f.height, f.width, 3)
+                    ).copy()
+                motion_field = None
+                if process_motion and f.motion_field and f.width > 0 and f.height > 0:
+                    motion_field = np.ctypeslib.as_array(
+                        f.motion_field, shape=(f.height, f.width, 2)
+                    ).copy()
+                result = {
+                    "decode_seq": int(f.decode_seq),
+                    "frame_offset": int(f.frame_offset),
+                    "frame_type": int(f.frame_type),
+                    "width": int(f.width),
+                    "height": int(f.height),
+                    "refidx": [int(x) for x in f.refidx],
+                    "refpoc": [int(x) for x in f.refpoc],
+                    "motion_vectors": mv,
+                    "reference_map": ref,
+                    "block_map": bs,
+                    "rgb": rgb,
+                    "bpc": int(f.bpc),
+                    "matrix": int(f.matrix),
+                    "full_range": bool(f.full_range),
+                }
+                if process_motion:
+                    result["motion_field"] = motion_field
+            finally:
+                shim.av1of_rgb_release_frame(handle, i)
+            yield result
+    finally:
+        shim.av1of_rgb_free(handle)
+
+
+def _nearest_resize_rgb(rgb: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize RGB with the same floor-mapped nearest sampling used by C."""
+    src_h, src_w = rgb.shape[:2]
+    ys = np.arange(height, dtype=np.int64) * src_h // height
+    xs = np.arange(width, dtype=np.int64) * src_w // width
+    return np.ascontiguousarray(rgb[ys[:, None], xs[None, :]])
+
+
+def _dense_motion_field(
+    frame: dict,
+    width: int,
+    height: int,
+    ref_distance: np.ndarray,
+    linear_interpolation: bool,
+    normalize: bool,
+    replace_nan: bool,
+) -> np.ndarray:
+    source_width, source_height = frame["width"], frame["height"]
+    mv = frame["motion_vectors"]
+    refs = frame["reference_map"]
+    blk_h, blk_w = mv.shape[:2]
+    ys = np.minimum(
+        (np.arange(height, dtype=np.int64) * source_height // height) // 4,
+        blk_h - 1,
+    )
+    xs = np.minimum(
+        (np.arange(width, dtype=np.int64) * source_width // width) // 4,
+        blk_w - 1,
+    )
+    field = mv[ys[:, None], xs[None, :], :2].astype(np.float32) / 8.0
+    if linear_interpolation:
+        ref_grid = refs[ys[:, None], xs[None, :], 0]
+        valid = (ref_grid >= 0) & (ref_grid < 8)
+        distances = np.zeros(ref_grid.shape, dtype=np.float32)
+        distances[valid] = ref_distance[ref_grid[valid]]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            field /= distances[..., None]
+        field[distances == 0] = np.nan
+    if normalize:
+        field[..., 0] /= source_width
+        field[..., 1] /= source_height
+        np.clip(field, -1.0, 1.0, out=field)
+    if replace_nan:
+        np.nan_to_num(field, copy=False, nan=0.0)
+    return np.ascontiguousarray(field, dtype=np.float32)
+
+
+def _iter_rgb_frames_via_callback(
+    ivf_path: str | Path,
+    n_threads: int,
+    lib: C.CDLL,
+    step: int,
+    max_frames: int,
+    target_width: int,
+    target_height: int,
+    process_motion: bool,
+    linear_interpolation: bool,
+    normalize_flow: bool,
+    nan_to_num: bool,
+):
+    order_counts = np.full(128, -1, dtype=np.int64)
+    kept = 0
+    frames = _iter_frames_via_callback(ivf_path, n_threads, lib, True)
+    for frame in frames:
+        hint = frame["frame_offset"] & 127
+        order_counts[hint] += 1
+        frame_number = hint + 128 * order_counts[hint]
+        ref_hints = np.asarray([0, *frame["refpoc"]], dtype=np.int64) & 127
+        ref_numbers = ref_hints + 128 * order_counts[ref_hints]
+        ref_distance = frame_number - ref_numbers
+        if frame["decode_seq"] % step:
+            continue
+        if max_frames and kept >= max_frames:
+            break
+        kept += 1
+
+        pixels = frame.pop("pixels", None)
+        rgb = yuv_to_rgb(pixels) if pixels is not None else None
+        out_width = target_width or frame["width"]
+        out_height = target_height or frame["height"]
+        if rgb is not None and target_width:
+            rgb = _nearest_resize_rgb(rgb, out_width, out_height)
+        result = {
+            **frame,
+            "width": out_width,
+            "height": out_height,
+            "rgb": rgb,
+            "bpc": int(pixels["bpc"]) if pixels is not None else 0,
+            "matrix": int(pixels["matrix"]) if pixels is not None else 2,
+            "full_range": bool(pixels["full_range"]) if pixels is not None else False,
+        }
+        if process_motion:
+            result["motion_field"] = _dense_motion_field(
+                frame,
+                out_width,
+                out_height,
+                ref_distance,
+                linear_interpolation,
+                normalize_flow,
+                nan_to_num,
+            )
+        yield result
 
 
 def _iter_frames_via_shim(shim: C.CDLL, ivf_path: str | Path, n_threads: int):

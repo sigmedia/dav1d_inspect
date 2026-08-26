@@ -2,6 +2,6 @@
 
 __version__ = "0.1.0a1"
 
-from dav1d_inspect.core import iter_frames, yuv_to_rgb
+from dav1d_inspect.core import iter_frames, iter_rgb_frames, yuv_to_rgb
 
-__all__ = ["iter_frames", "yuv_to_rgb"]
+__all__ = ["iter_frames", "iter_rgb_frames", "yuv_to_rgb"]

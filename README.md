@@ -134,6 +134,38 @@ retaining the reconstructed pictures), so it is slower than metadata-only runs.
 
 ### RGB conversion
 
+For RGB plus motion metadata, the recommended API is `iter_rgb_frames`.  It
+performs one native dav1d decode with the GIL released, converts directly to
+RGB in C, and can materialize only sampled/downscaled frames:
+
+```python
+from dav1d_inspect import iter_rgb_frames
+
+for frame in iter_rgb_frames(
+    "path/to/video.ivf",
+    n_threads=4,
+    step=2,
+    max_frames=16,
+    target_size=(224, 224),       # (width, height)
+    process_motion=True,
+    linear_interpolation=True,
+    normalize_flow=True,
+    nan_to_num=True,
+):
+    rgb = frame["rgb"]                 # (224, 224, 3) uint8
+    flow = frame["motion_field"]       # (224, 224, 2) float32 [x, y]
+```
+
+The dense field lifts the primary/backward 4x4-block MV with nearest-neighbour
+sampling. MVs are converted from 1/8-pel units to pixels; optional temporal
+interpolation divides by the unwrapped reference distance, and normalization
+divides x/y by the coded width/height and clips to `[-1, 1]`. Native buffers are
+released frame-by-frame after NumPy has copied them. If the additive RGB shim
+ABI is unavailable, the function falls back to the ctypes decoder.
+
+The older conversion interface remains available for compatibility and for
+callers that specifically need reconstructed YUV planes.
+
 Pass `want_rgb=True` (implies `want_pixels`) to also get an `(H, W, 3)` uint8
 RGB image per frame, or call `yuv_to_rgb` on a `pixels` dict directly:
 

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Native build artifacts (rebuilt at install time by the hatchling build hook)
+dav1d_inspect/_libs/*.so
+dav1d_inspect/_libs/*.dylib
+dav1d_inspect/_libs/*.dll
+native/dav1d/build/
+
+# Editor/misc
+*.ivf.un~

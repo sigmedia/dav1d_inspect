@@ -12,5 +12,9 @@ dav1d_inspect/_libs/*.dylib
 dav1d_inspect/_libs/*.dll
 native/dav1d/build/
 
+# AOM inspect reference build (./build.sh --test)
+test/aom/
+test/aom_build/
+
 # Editor/misc
 *.ivf.un~

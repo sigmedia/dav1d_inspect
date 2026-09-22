@@ -90,8 +90,9 @@ enum Dav1dDecodeFrameType {
  *     offset 10: uint8_t bs                 (enum BlockSize, dav1d ordering)
  *     offset 11: uint8_t mf                 (mode flags: 1 = globalmv/affine, 2 = newmv)
  *
- * `blocks` is NULL for intra/key frames (no motion field). The pointer is only
- * valid for the duration of the callback; copy out anything you need to keep.
+ * For intra/key frames, motion vectors are zero, references are `{ 0, -1 }`,
+ * and `bs` still contains the decoded block size. The pointer is only valid for
+ * the duration of the callback; copy out anything you need to keep.
  */
 typedef struct Dav1dInspectData {
     unsigned decode_seq;     ///< monotonic decode-order index (for reordering
@@ -101,7 +102,7 @@ typedef struct Dav1dInspectData {
     int width, height;       ///< luma dimensions in pixels
     int blk_w, blk_h;        ///< valid block-grid dimensions, in 4x4 blocks
     ptrdiff_t blk_stride;    ///< row stride of `blocks`, in 12-byte records
-    const void *blocks;      ///< 4x4 spatial block grid, or NULL (intra)
+    const void *blocks;      ///< 4x4 spatial block grid
     int8_t refidx[7];        ///< reference slot index per ref frame
     unsigned refpoc[7];      ///< order hint / POC of each reference frame
 } Dav1dInspectData;

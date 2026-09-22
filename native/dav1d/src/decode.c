@@ -703,6 +703,20 @@ static int decode_b(Dav1dTaskContext *const t,
                            (bw4 > ss_hor || t->bx & 1) &&
                            (bh4 > ss_ver || t->by & 1);
 
+#if CONFIG_INSPECTION
+    // Key/intra frames do not allocate dav1d's ref-MV grid, but their coding
+    // block sizes are still meaningful. Store each decoded block directly in
+    // the persistent inspection grid. Inter/switch frames continue to use the
+    // ref-MV harvest below so their motion and reference metadata is retained.
+    if (f->inspect_r && !IS_INTER_OR_SWITCH(f->frame_hdr) &&
+        t->frame_thread.pass != 2)
+    {
+        for (int y = 0; y < h4; y++)
+            for (int x = 0; x < w4; x++)
+                f->inspect_r[(size_t) (t->by + y) * f->bw + t->bx + x].bs = bs;
+    }
+#endif
+
     if (t->frame_thread.pass == 2) {
         if (b->intra) {
             f->bd_fn.recon_b_intra(t, bs, intra_edge_flags, b);
@@ -2731,7 +2745,8 @@ int dav1d_decode_tile_sbrow(Dav1dTaskContext *const t) {
     // task threads do not race. Harvest in the symbol-decode pass only (pass 0 =
     // single pass, pass 1 = first pass of 2-pass frame threading); the refmvs
     // window is not repopulated in the reconstruction pass (pass 2).
-    if (f->inspect_r && t->frame_thread.pass != 2) {
+    if (f->inspect_r && IS_INTER_OR_SWITCH(f->frame_hdr) &&
+        t->frame_thread.pass != 2) {
         dav1d_refmvs_save_inspect(&t->rt, f->inspect_r, f->bw,
                                   ts->tiling.col_start, ts->tiling.col_end,
                                   t->by, t->by + sb_step);
@@ -3242,7 +3257,7 @@ int dav1d_decode_frame_main(Dav1dFrameContext *const f) {
                                        0, f->bw >> 1, t->by >> 1, by_end);
             }
 #if CONFIG_INSPECTION
-            if (f->inspect_r) {
+            if (f->inspect_r && IS_INTER_OR_SWITCH(f->frame_hdr)) {
                 dav1d_refmvs_save_inspect(&t->rt, f->inspect_r, f->bw,
                                           0, f->bw, t->by, t->by + f->sb_step);
             }
@@ -3267,8 +3282,9 @@ void dav1d_decode_frame_exit(Dav1dFrameContext *const f, int retval) {
 #if CONFIG_INSPECTION
     // AV1-Optical-Flow: deliver per-frame block metadata before the internal
     // buffers are released below. Exposes the full-frame 4x4 spatial block grid
-    // (motion vectors, reference indices, block size); intra/key frames carry no
-    // motion field.
+    // (motion vectors, reference indices, block size). Intra/key frames retain
+    // their decoded block sizes while carrying zero motion and intra reference
+    // defaults.
     if (!retval && c->inspect_cb && f->frame_hdr) {
         Dav1dInspectData data;
         data.decode_seq   = f->inspect_seq;
@@ -3276,13 +3292,11 @@ void dav1d_decode_frame_exit(Dav1dFrameContext *const f, int retval) {
         data.frame_type   = f->frame_hdr->frame_type;
         data.width        = f->cur.p.w;
         data.height       = f->cur.p.h;
-        // f->bw / f->bh are the 4x4 grid dims (== rf->iw4 / ih4); always report
-        // them so intra frames still produce a correctly-sized (empty) grid.
+        // f->bw / f->bh are the 4x4 grid dims (== rf->iw4 / ih4).
         data.blk_w      = f->bw;
         data.blk_h      = f->bh;
         data.blk_stride = f->bw;
-        data.blocks     = (IS_INTER_OR_SWITCH(f->frame_hdr) && f->inspect_r)
-                          ? f->inspect_r : NULL;
+        data.blocks     = f->inspect_r;
         for (int i = 0; i < 7; i++) {
             data.refidx[i] = f->frame_hdr->refidx[i];
             data.refpoc[i] = f->refpoc[i];
@@ -3625,6 +3639,24 @@ int dav1d_submit_frame(Dav1dContext *const c) {
     atomic_store(&f->task_thread.task_counter,
                  (cols * rows + f->sbh) << uses_2pass);
 
+#if CONFIG_INSPECTION
+    // Keep a persistent 4x4 metadata grid for every frame. Inter/switch frames
+    // are populated from refmvs; key/intra frames populate `bs` directly in
+    // decode_b() and retain these zero-motion, intra-reference defaults.
+    if (c->inspect_cb) {
+        const size_t n_blocks = (size_t) f->bw * f->bh;
+        const size_t r_sz = sizeof(*f->inspect_r) * n_blocks;
+        f->inspect_r = dav1d_alloc_aligned(ALLOC_REFMVS, r_sz, 64);
+        if (!f->inspect_r) {
+            res = DAV1D_ERR(ENOMEM);
+            goto error;
+        }
+        memset(f->inspect_r, 0, r_sz);
+        for (size_t i = 0; i < n_blocks; i++)
+            f->inspect_r[i].ref.ref[1] = -1;
+    }
+#endif
+
     // ref_mvs
     if (IS_INTER_OR_SWITCH(f->frame_hdr) || f->frame_hdr->allow_intrabc) {
         f->mvs_ref = dav1d_ref_create_using_pool(c->refmvs_pool,
@@ -3634,19 +3666,6 @@ int dav1d_submit_frame(Dav1dContext *const c) {
             goto error;
         }
         f->mvs = f->mvs_ref->data;
-#if CONFIG_INSPECTION
-        // AV1-Optical-Flow: full-frame 4x4 spatial block grid, harvested per
-        // sbrow during decode (see dav1d_refmvs_save_inspect). Inter frames only.
-        if (c->inspect_cb && IS_INTER_OR_SWITCH(f->frame_hdr)) {
-            const size_t r_sz = sizeof(*f->inspect_r) * f->bw * f->bh;
-            f->inspect_r = dav1d_alloc_aligned(ALLOC_REFMVS, r_sz, 64);
-            if (!f->inspect_r) {
-                res = DAV1D_ERR(ENOMEM);
-                goto error;
-            }
-            memset(f->inspect_r, 0, r_sz);
-        }
-#endif
         if (!f->frame_hdr->allow_intrabc) {
             for (int i = 0; i < 7; i++)
                 f->refpoc[i] = f->refp[i].p.frame_hdr->frame_offset;

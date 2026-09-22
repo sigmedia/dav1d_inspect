@@ -125,7 +125,7 @@ static void inspect_cb(void *cookie, const Dav1dInspectData *d) {
         return;
     }
 
-    const uint8_t *const blocks = d->blocks; // NULL for intra/key frames
+    const uint8_t *const blocks = d->blocks; // NULL only if metadata is unavailable
     const ptrdiff_t stride = d->blk_stride;  // in 12-byte records
 
     for (int y = 0; y < H; y++) {
